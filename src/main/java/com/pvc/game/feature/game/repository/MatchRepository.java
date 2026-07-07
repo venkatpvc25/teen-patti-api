@@ -15,6 +15,8 @@ import com.pvc.game.feature.game.entity.PlayerResult;
 import com.pvc.game.feature.game.entity.MatchStatus;
 
 public interface MatchRepository extends JpaRepository<Match, UUID> {
+    List<Match> findByStatus(MatchStatus status);
+
     Optional<Match> findFirstByGameTypeAndModeAndStatusAndStakeOrderByCreatedAtAsc(
             GameType gameType,
             MatchMode mode,

@@ -24,6 +24,8 @@ jwt:
   access-expiration: ${JWT_ACCESS_EXPIRATION:3600000}
 
 app:
+  game:
+    turn-timeout-sweep-ms: ${TURN_TIMEOUT_SWEEP_MS:5000}
   test-users:
     enabled: ${TEST_USERS_ENABLED:true}
   razorpay:

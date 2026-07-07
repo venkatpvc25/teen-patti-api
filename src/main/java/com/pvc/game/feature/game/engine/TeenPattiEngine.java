@@ -1,5 +1,6 @@
 package com.pvc.game.feature.game.engine;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -17,11 +18,26 @@ import lombok.RequiredArgsConstructor;
 @RequiredArgsConstructor
 public class TeenPattiEngine {
 
-    private static final List<String> SUPPORTED_ACTIONS = List.of("SEE", "PACK", "BLIND", "CHAAL", "SHOW", "SIDE_SHOW");
+    private static final long TURN_SECONDS = 30;
+    private static final List<String> SUPPORTED_ACTIONS = List.of(
+            "SEE",
+            "PACK",
+            "BLIND",
+            "RAISE",
+            "CHAAL",
+            "SHOW",
+            "SIDE_SHOW",
+            "SIDE_SHOW_REQUEST",
+            "SIDE_SHOW_ACCEPT",
+            "SIDE_SHOW_DECLINE");
 
     private final ObjectMapper objectMapper;
 
     public String newServerState(List<PlayerSeat> seats, long bootAmount) {
+        return newServerState(seats, bootAmount, seats.get(seats.size() - 1).seatNo());
+    }
+
+    public String newServerState(List<PlayerSeat> seats, long bootAmount, int dealerSeat) {
         if (seats.size() < 2 || seats.size() > 5) {
             throw new IllegalArgumentException("Teen Patti requires 2 to 5 players");
         }
@@ -32,8 +48,7 @@ public class TeenPattiEngine {
         state.bootAmount = Math.max(0, bootAmount);
         state.currentStake = Math.max(1, bootAmount);
         state.pot = Math.max(0, bootAmount) * seats.size();
-        state.turnSeat = seats.get(0).seatNo();
-        state.dealerSeat = seats.get(0).seatNo();
+        state.dealerSeat = dealerSeat;
         state.deckRemaining = deck.size() - (seats.size() * 3);
 
         int cursor = 0;
@@ -49,6 +64,9 @@ public class TeenPattiEngine {
             player.chipsCommitted = Math.max(0, bootAmount);
             state.players.add(player);
         }
+        findPlayer(state, dealerSeat);
+        state.turnSeat = nextActiveSeat(state, dealerSeat);
+        startTurnTimer(state);
         return write(state);
     }
 
@@ -61,6 +79,9 @@ public class TeenPattiEngine {
         }
 
         PlayerState player = findPlayer(state, seatNo);
+        if (state.pendingSideShowRequestorSeat >= 0) {
+            return resolvePendingSideShow(state, player, normalizedAction);
+        }
         if (!player.active || player.packed) {
             throw new IllegalStateException("Player is no longer active");
         }
@@ -72,9 +93,10 @@ public class TeenPattiEngine {
             case "SEE" -> see(state, player);
             case "PACK" -> pack(state, player);
             case "BLIND" -> blind(state, player, chips);
+            case "RAISE" -> player.blind ? blind(state, player, chips) : chaal(state, player, chips);
             case "CHAAL" -> chaal(state, player, chips);
             case "SHOW" -> show(state, player, chips);
-            case "SIDE_SHOW" -> sideShow(state, player, chips);
+            case "SIDE_SHOW", "SIDE_SHOW_REQUEST" -> requestSideShow(state, player, chips);
             default -> throw new IllegalArgumentException("Unsupported move");
         };
 
@@ -87,7 +109,10 @@ public class TeenPattiEngine {
             finishIfOnlyOneActive(state);
         }
         if (!"FINISHED".equals(state.phase)) {
-            state.turnSeat = nextActiveSeat(state, seatNo);
+            if (state.pendingSideShowRequestorSeat < 0) {
+                state.turnSeat = nextActiveSeat(state, seatNo);
+            }
+            startTurnTimer(state);
         }
 
         return result(state, debit);
@@ -111,30 +136,21 @@ public class TeenPattiEngine {
         state.lastActionSeat = seatNo;
         state.lastDealerTipSeat = seatNo;
         state.lastDealerTipAmount = chips;
+        startTurnTimer(state);
         return new TipResult(write(state), publicState(serverStateJsonFor(state), null), chips);
     }
 
     public MoveResult applyAutomaticMove(String serverStateJson, int seatNo) {
         TeenPattiState state = read(serverStateJson);
         ensureActiveState(state);
+        clearPendingSideShow(state);
         PlayerState player = findPlayer(state, seatNo);
         if (state.turnSeat != seatNo || !player.active || player.packed) {
             return result(state, 0);
         }
 
-        long debit;
-        List<PlayerState> active = activePlayers(state);
-        if (active.size() == 2) {
-            long required = player.blind ? state.currentStake : state.currentStake * 2;
-            debit = show(state, player, required);
-            state.lastAction = "SHOW";
-        } else if (player.blind) {
-            debit = blind(state, player, state.currentStake);
-            state.lastAction = "BLIND";
-        } else {
-            debit = chaal(state, player, state.currentStake * 2);
-            state.lastAction = "CHAAL";
-        }
+        long debit = pack(state, player);
+        state.lastAction = "AUTO_PACK";
 
         player.chipsCommitted += debit;
         state.pot += debit;
@@ -144,8 +160,36 @@ public class TeenPattiEngine {
         }
         if (!"FINISHED".equals(state.phase)) {
             state.turnSeat = nextActiveSeat(state, seatNo);
+            startTurnTimer(state);
         }
         return result(state, debit);
+    }
+
+    public boolean isTurnExpired(String serverStateJson, Instant now) {
+        TeenPattiState state = read(serverStateJson);
+        if ("FINISHED".equals(state.phase) || state.turnDeadlineAt == null) {
+            return false;
+        }
+        return !Instant.parse(state.turnDeadlineAt).isAfter(now);
+    }
+
+    public int currentTurnSeat(String serverStateJson) {
+        return read(serverStateJson).turnSeat;
+    }
+
+    public int nextDealerSeat(String serverStateJson, List<Integer> seats) {
+        TeenPattiState state = read(serverStateJson);
+        if (seats.isEmpty()) {
+            throw new IllegalArgumentException("Seats are required");
+        }
+        int currentDealer = state.dealerSeat;
+        List<Integer> orderedSeats = seats.stream().sorted().toList();
+        for (int seat : orderedSeats) {
+            if (seat > currentDealer) {
+                return seat;
+            }
+        }
+        return orderedSeats.get(0);
     }
 
     public String publicState(String serverStateJson, Integer viewerSeatNo) {
@@ -157,6 +201,10 @@ public class TeenPattiEngine {
         view.pot = state.pot;
         view.turnSeat = state.turnSeat;
         view.dealerSeat = state.dealerSeat;
+        view.turnDeadlineAt = state.turnDeadlineAt;
+        view.pendingSideShowRequestorSeat = state.pendingSideShowRequestorSeat;
+        view.pendingSideShowOpponentSeat = state.pendingSideShowOpponentSeat;
+        view.pendingSideShowChips = state.pendingSideShowChips;
         view.dealerTipTotal = state.dealerTipTotal;
         view.deckRemaining = state.deckRemaining;
         view.lastAction = state.lastAction;
@@ -176,6 +224,9 @@ public class TeenPattiEngine {
             publicPlayer.packed = player.packed;
             publicPlayer.chipsCommitted = player.chipsCommitted;
             publicPlayer.dealerTips = player.dealerTips;
+            publicPlayer.minBet = minBetFor(state, player);
+            publicPlayer.maxBet = maxBetFor(state, player);
+            publicPlayer.allowedActions = allowedActionsFor(state, player);
             publicPlayer.cardsVisible = viewerSeatNo != null && viewerSeatNo == player.seatNo || "FINISHED".equals(state.phase);
             if (publicPlayer.cardsVisible) {
                 publicPlayer.cards = player.cards;
@@ -243,7 +294,7 @@ public class TeenPattiEngine {
         return chips;
     }
 
-    private long sideShow(TeenPattiState state, PlayerState player, long chips) {
+    private long requestSideShow(TeenPattiState state, PlayerState player, long chips) {
         if (player.blind) {
             throw new IllegalStateException("Blind players must SEE before SIDE_SHOW");
         }
@@ -255,10 +306,45 @@ public class TeenPattiEngine {
         requireExactBet(chips, required, "Side show");
 
         PlayerState opponent = previousActiveSeenPlayer(state, player.seatNo);
-        PlayerState loser = compareHands(player, opponent) >= 0 ? opponent : player;
-        loser.active = false;
-        loser.packed = true;
+        state.pendingSideShowRequestorSeat = player.seatNo;
+        state.pendingSideShowOpponentSeat = opponent.seatNo;
+        state.pendingSideShowChips = chips;
+        state.turnSeat = opponent.seatNo;
+        startTurnTimer(state);
         return chips;
+    }
+
+    private MoveResult resolvePendingSideShow(TeenPattiState state, PlayerState player, String action) {
+        if (player.seatNo != state.pendingSideShowOpponentSeat) {
+            throw new IllegalStateException("Waiting for side show opponent response");
+        }
+        if (!action.equals("SIDE_SHOW_ACCEPT") && !action.equals("SIDE_SHOW_DECLINE")) {
+            throw new IllegalStateException("Side show must be accepted or declined");
+        }
+        if (!player.active || player.packed || player.blind) {
+            clearPendingSideShow(state);
+            throw new IllegalStateException("Side show opponent is not eligible");
+        }
+
+        int requestorSeat = state.pendingSideShowRequestorSeat;
+        PlayerState requestor = findPlayer(state, requestorSeat);
+        if (action.equals("SIDE_SHOW_ACCEPT")) {
+            PlayerState loser = compareHands(requestor, player) >= 0 ? player : requestor;
+            loser.active = false;
+            loser.packed = true;
+        }
+
+        clearPendingSideShow(state);
+        state.lastAction = action;
+        state.lastActionSeat = player.seatNo;
+        if (!"FINISHED".equals(state.phase)) {
+            finishIfOnlyOneActive(state);
+        }
+        if (!"FINISHED".equals(state.phase)) {
+            state.turnSeat = nextActiveSeat(state, requestorSeat);
+            startTurnTimer(state);
+        }
+        return result(state, 0);
     }
 
     private PlayerState previousActiveSeenPlayer(TeenPattiState state, int seatNo) {
@@ -291,6 +377,8 @@ public class TeenPattiEngine {
     private void finish(TeenPattiState state, PlayerState winner) {
         state.phase = "FINISHED";
         state.turnSeat = -1;
+        state.turnDeadlineAt = null;
+        clearPendingSideShow(state);
         state.winnerSeat = winner.seatNo;
         state.winnerUserId = winner.userId;
         for (PlayerState player : state.players) {
@@ -335,6 +423,77 @@ public class TeenPattiEngine {
         if ("FINISHED".equals(state.phase)) {
             throw new IllegalStateException("Match is already finished");
         }
+    }
+
+    private List<String> allowedActionsFor(TeenPattiState state, PlayerState player) {
+        if (!player.active || player.packed || "FINISHED".equals(state.phase)) {
+            return List.of();
+        }
+        if (state.pendingSideShowRequestorSeat >= 0) {
+            if (player.seatNo == state.pendingSideShowOpponentSeat) {
+                return List.of("SIDE_SHOW_ACCEPT", "SIDE_SHOW_DECLINE");
+            }
+            return List.of();
+        }
+        if (player.seatNo != state.turnSeat) {
+            return List.of();
+        }
+        List<PlayerState> active = activePlayers(state);
+        List<String> actions = new ArrayList<>();
+        actions.add("PACK");
+        if (player.blind) {
+            actions.add("SEE");
+            actions.add("BLIND");
+            actions.add("RAISE");
+            if (active.size() == 2) {
+                actions.add("SHOW");
+            }
+            return actions;
+        }
+        actions.add("CHAAL");
+        actions.add("RAISE");
+        if (active.size() == 2) {
+            actions.add("SHOW");
+        } else if (hasPreviousActiveSeenPlayer(state, player.seatNo)) {
+            actions.add("SIDE_SHOW_REQUEST");
+        }
+        return actions;
+    }
+
+    private long minBetFor(TeenPattiState state, PlayerState player) {
+        if (!player.active || player.packed) {
+            return 0;
+        }
+        return player.blind ? state.currentStake : state.currentStake * 2;
+    }
+
+    private long maxBetFor(TeenPattiState state, PlayerState player) {
+        if (!player.active || player.packed) {
+            return 0;
+        }
+        long min = minBetFor(state, player);
+        return player.blind ? Math.max(min, state.currentStake * 2) : Math.max(min, state.currentStake * 4);
+    }
+
+    private boolean hasPreviousActiveSeenPlayer(TeenPattiState state, int seatNo) {
+        try {
+            previousActiveSeenPlayer(state, seatNo);
+            return true;
+        } catch (IllegalStateException exception) {
+            return false;
+        }
+    }
+
+    private void clearPendingSideShow(TeenPattiState state) {
+        state.pendingSideShowRequestorSeat = -1;
+        state.pendingSideShowOpponentSeat = -1;
+        state.pendingSideShowChips = 0;
+    }
+
+    private void startTurnTimer(TeenPattiState state) {
+        state.turnDeadlineAt = state.turnSeat >= 0
+                ? Instant.now().plusSeconds(TURN_SECONDS).toString()
+                : null;
     }
 
     private void requireBet(long chips, long min, long max, String label) {
@@ -480,6 +639,10 @@ public class TeenPattiEngine {
         public long pot;
         public int turnSeat;
         public int dealerSeat;
+        public String turnDeadlineAt;
+        public int pendingSideShowRequestorSeat = -1;
+        public int pendingSideShowOpponentSeat = -1;
+        public long pendingSideShowChips;
         public long dealerTipTotal;
         public int deckRemaining;
         public String lastAction;
@@ -510,6 +673,10 @@ public class TeenPattiEngine {
         public long pot;
         public int turnSeat;
         public int dealerSeat;
+        public String turnDeadlineAt;
+        public int pendingSideShowRequestorSeat;
+        public int pendingSideShowOpponentSeat;
+        public long pendingSideShowChips;
         public long dealerTipTotal;
         public int deckRemaining;
         public String lastAction;
@@ -530,6 +697,9 @@ public class TeenPattiEngine {
         public boolean packed;
         public long chipsCommitted;
         public long dealerTips;
+        public long minBet;
+        public long maxBet;
+        public List<String> allowedActions = new ArrayList<>();
         public boolean cardsVisible;
         public List<String> cards;
         public String handRank;

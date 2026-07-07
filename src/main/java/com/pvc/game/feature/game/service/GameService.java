@@ -8,8 +8,12 @@ import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -34,6 +38,7 @@ import lombok.RequiredArgsConstructor;
 @RequiredArgsConstructor
 public class GameService {
 
+    private static final Logger log = LoggerFactory.getLogger(GameService.class);
     private static final UUID PRACTICE_AI_USER_ID = UUID.fromString("00000000-0000-0000-0000-000000000001");
 
     private final MatchRepository matchRepository;
@@ -100,6 +105,7 @@ public class GameService {
     public MatchResponse applyMove(User user, UUID matchId, String action, long chips) {
         Match match = matchRepository.findById(matchId)
                 .orElseThrow(() -> new IllegalArgumentException("Match not found"));
+        applyExpiredTurnIfNeeded(match);
         List<MatchPlayer> players = matchPlayerRepository.findByMatchOrderBySeatNoAsc(match);
         MatchPlayer player = players.stream()
                 .filter(matchPlayer -> matchPlayer.getUser().getId().equals(user.getId()))
@@ -166,7 +172,15 @@ public class GameService {
         if (!matchPlayerRepository.existsByMatchAndUser(match, user)) {
             throw new IllegalStateException("User is not in this match");
         }
+        applyExpiredTurnIfNeeded(match);
         return response(match, user);
+    }
+
+    @Scheduled(fixedDelayString = "${app.game.turn-timeout-sweep-ms:5000}")
+    @Transactional
+    public void applyExpiredTurns() {
+        matchRepository.findByStatus(MatchStatus.ACTIVE)
+                .forEach(this::applyExpiredTurnIfNeeded);
     }
 
     private Optional<Match> findJoinablePublicMatch(GameType gameType, long stake) {
@@ -282,10 +296,25 @@ public class GameService {
     private void publish(Match match) {
         List<MatchPlayer> players = matchPlayerRepository.findByMatchOrderBySeatNoAsc(match);
         MatchResponse response = MatchResponse.from(match, players, teenPattiEngine.publicState(match.getServerStateJson(), null));
+        String topic = "/topic/matches/" + response.getId();
+        log.info("Publishing match websocket update topic={} matchId={} mode={} status={} players={} state={}",
+                topic,
+                response.getId(),
+                response.getMode(),
+                response.getStatus(),
+                playerSummary(players),
+                response.getServerStateJson());
         messagingTemplate.convertAndSend("/topic/matches/" + response.getId(), response);
     }
 
     private void finishMatch(Match match, List<MatchPlayer> players, int winnerSeat, long pot) {
+        log.info("Finishing match matchId={} mode={} winnerSeat={} pot={} playersBeforeFinish={} stateBeforeFinish={}",
+                match.getId(),
+                match.getMode(),
+                winnerSeat,
+                pot,
+                playerSummary(players),
+                match.getServerStateJson());
         match.setStatus(MatchStatus.FINISHED);
         match.setFinishedAt(Instant.now());
 
@@ -314,12 +343,24 @@ public class GameService {
 
     private void startNextHandIfReady(Match match, List<MatchPlayer> players) {
         if (match.getMode() == MatchMode.PRACTICE_AI) {
+            startPracticeNextHandIfReady(match, players);
             return;
         }
 
+        log.info("Evaluating next hand matchId={} mode={} stake={} minPlayers={} playersBeforeNextHand={}",
+                match.getId(),
+                match.getMode(),
+                match.getStake(),
+                match.getMinPlayers(),
+                playerSummary(players));
         for (MatchPlayer player : players) {
             if (player.getResult() == PlayerResult.WON || player.getResult() == PlayerResult.LOST) {
                 if (match.getStake() > 0 && walletService.getWallet(player.getUser()).getBalance() < match.getStake()) {
+                    log.info("Player cannot continue next hand matchId={} userId={} seatNo={} balanceBelowStake stake={}",
+                            match.getId(),
+                            player.getUser().getId(),
+                            player.getSeatNo(),
+                            match.getStake());
                     player.setResult(PlayerResult.LEFT);
                     player.setChipsCommitted(0);
                     continue;
@@ -340,6 +381,9 @@ public class GameService {
 
         match.setWinnerUserId(null);
         if (nextHandPlayers.size() >= match.getMinPlayers()) {
+            int nextDealerSeat = teenPattiEngine.nextDealerSeat(
+                    match.getServerStateJson(),
+                    nextHandPlayers.stream().map(MatchPlayer::getSeatNo).toList());
             match.setStatus(MatchStatus.ACTIVE);
             match.setStartedAt(Instant.now());
             match.setFinishedAt(null);
@@ -348,12 +392,114 @@ public class GameService {
                             player.getSeatNo(),
                             player.getUser().getId(),
                             player.getUser().getNickname()))
-                    .toList(), match.getStake()));
+                    .toList(), match.getStake(), nextDealerSeat));
+            log.info("Started next hand matchId={} status={} nextDealerSeat={} nextHandPlayers={} newState={}",
+                    match.getId(),
+                    match.getStatus(),
+                    nextDealerSeat,
+                    playerSummary(nextHandPlayers),
+                    match.getServerStateJson());
         } else {
             match.setStatus(MatchStatus.WAITING);
             match.setStartedAt(null);
             match.setServerStateJson("{\"phase\":\"WAITING\"}");
+            log.info("Next hand not ready matchId={} status={} eligiblePlayers={} minPlayers={} players={}",
+                    match.getId(),
+                    match.getStatus(),
+                    nextHandPlayers.size(),
+                    match.getMinPlayers(),
+                    playerSummary(players));
         }
+    }
+
+    private void startPracticeNextHandIfReady(Match match, List<MatchPlayer> players) {
+        MatchPlayer player = players.stream()
+                .filter(matchPlayer -> matchPlayer.getSeatNo() == 0)
+                .findFirst()
+                .orElse(null);
+        if (player == null || player.getResult() == PlayerResult.LEFT) {
+            match.setStatus(MatchStatus.WAITING);
+            match.setStartedAt(null);
+            match.setServerStateJson("{\"phase\":\"WAITING\"}");
+            log.info("Practice next hand not ready matchId={} reason=no-active-human-player players={}",
+                    match.getId(),
+                    playerSummary(players));
+            return;
+        }
+        if (match.getStake() > 0 && walletService.getWallet(player.getUser()).getBalance() < match.getStake()) {
+            player.setResult(PlayerResult.LEFT);
+            player.setChipsCommitted(0);
+            matchPlayerRepository.save(player);
+            match.setStatus(MatchStatus.WAITING);
+            match.setStartedAt(null);
+            match.setServerStateJson("{\"phase\":\"WAITING\"}");
+            log.info("Practice next hand not ready matchId={} reason=balance-below-stake userId={} stake={} players={}",
+                    match.getId(),
+                    player.getUser().getId(),
+                    match.getStake(),
+                    playerSummary(players));
+            return;
+        }
+
+        if (player.getResult() == PlayerResult.WON || player.getResult() == PlayerResult.LOST) {
+            debitStake(player.getUser(), match.getStake(), "PRACTICE_NEXT_HAND_STAKE");
+        }
+        player.setResult(PlayerResult.PLAYING);
+        player.setChipsCommitted(match.getStake());
+        matchPlayerRepository.save(player);
+
+        int nextDealerSeat = teenPattiEngine.nextDealerSeat(match.getServerStateJson(), List.of(0, 1));
+        match.setWinnerUserId(null);
+        match.setStatus(MatchStatus.ACTIVE);
+        match.setStartedAt(Instant.now());
+        match.setFinishedAt(null);
+        match.setServerStateJson(teenPattiEngine.newServerState(List.of(
+                new TeenPattiEngine.PlayerSeat(0, player.getUser().getId(), player.getUser().getNickname()),
+                new TeenPattiEngine.PlayerSeat(1, PRACTICE_AI_USER_ID, "AI Player")),
+                match.getStake(),
+                nextDealerSeat));
+        log.info("Started practice next hand matchId={} status={} nextDealerSeat={} player={} newState={}",
+                match.getId(),
+                match.getStatus(),
+                nextDealerSeat,
+                playerSummary(List.of(player)),
+                match.getServerStateJson());
+    }
+
+    private String playerSummary(List<MatchPlayer> players) {
+        return players.stream()
+                .map(player -> "seat=" + player.getSeatNo()
+                        + ",user=" + player.getUser().getId()
+                        + ",result=" + player.getResult()
+                        + ",chips=" + player.getChipsCommitted())
+                .collect(Collectors.joining("; ", "[", "]"));
+    }
+
+    private void applyExpiredTurnIfNeeded(Match match) {
+        if (match.getStatus() != MatchStatus.ACTIVE
+                || !teenPattiEngine.isTurnExpired(match.getServerStateJson(), Instant.now())) {
+            return;
+        }
+
+        List<MatchPlayer> players = matchPlayerRepository.findByMatchOrderBySeatNoAsc(match);
+        int seatNo = teenPattiEngine.currentTurnSeat(match.getServerStateJson());
+        MatchPlayer player = players.stream()
+                .filter(matchPlayer -> matchPlayer.getSeatNo() == seatNo)
+                .findFirst()
+                .orElse(null);
+        if (player == null || player.getResult() != PlayerResult.PLAYING) {
+            return;
+        }
+
+        TeenPattiEngine.MoveResult result = teenPattiEngine.applyAutomaticMove(
+                match.getServerStateJson(),
+                seatNo);
+        match.setServerStateJson(result.serverStateJson());
+        if (result.finished()) {
+            finishMatch(match, players, result.winnerSeat(), result.pot());
+        }
+        matchRepository.save(match);
+        publish(match);
     }
 
     private void debitStake(User user, long stake, String source) {
