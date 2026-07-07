@@ -21,6 +21,8 @@ app:
   razorpay:
     key-id: ${RAZORPAY_KEY_ID}
     key-secret: ${RAZORPAY_KEY_SECRET}
+    account-number: ${RAZORPAY_ACCOUNT_NUMBER:}
+    withdrawal-paise-per-chip: ${RAZORPAY_WITHDRAWAL_PAISE_PER_CHIP:1}
 
 server:
   port: ${SERVER_PORT:8080}
