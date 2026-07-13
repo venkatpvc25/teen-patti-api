@@ -19,20 +19,30 @@ spring:
 server:
   port: ${SERVER_PORT:8080}
 
+logging:
+  pattern:
+    level: "%5p [requestId:%X{requestId:-}]"
+  level:
+    com.pvc.game: ${APP_LOG_LEVEL:INFO}
+
 jwt:
   secret: ${JWT_SECRET:change-this-local-secret-change-this-local-secret}
   access-expiration: ${JWT_ACCESS_EXPIRATION:3600000}
 
 app:
+  cors:
+    allowed-origins: ${APP_CORS_ALLOWED_ORIGINS:http://localhost:3000,http://localhost:5173}
+  docs:
+    public-enabled: ${APP_DOCS_PUBLIC_ENABLED:${SWAGGER_ENABLED:true}}
   game:
     turn-timeout-sweep-ms: ${TURN_TIMEOUT_SWEEP_MS:5000}
+  otp:
+    log-enabled: ${APP_OTP_LOG_ENABLED:true}
   test-users:
     enabled: ${TEST_USERS_ENABLED:true}
   razorpay:
     key-id: ${RAZORPAY_KEY_ID:}
     key-secret: ${RAZORPAY_KEY_SECRET:}
-    account-number: ${RAZORPAY_ACCOUNT_NUMBER:}
-    withdrawal-paise-per-chip: ${RAZORPAY_WITHDRAWAL_PAISE_PER_CHIP:1}
 
 management:
   endpoints:

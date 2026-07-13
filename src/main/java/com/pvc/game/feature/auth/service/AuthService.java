@@ -20,9 +20,11 @@ import com.pvc.game.security.JwtService;
 import com.pvc.game.feature.wallet.service.WalletService;
 
 import jakarta.servlet.http.HttpServletRequest;
+import lombok.extern.slf4j.Slf4j;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class AuthService {
 
     private static final List<TestUserSpec> TEST_USERS = List.of(
@@ -40,10 +42,14 @@ public class AuthService {
     @Value("${app.test-users.enabled:true}")
     private boolean testUsersEnabled;
 
+    @Value("${app.otp.log-enabled:true}")
+    private boolean otpLogEnabled;
+
     @Transactional
     public OtpResponse requestOtp(PhoneOtpRequest request, HttpServletRequest httpRequest) {
         String phone = normalizePhone(request.getPhone());
         String otp = generateOtp();
+        log.info("OTP requested phone={} remoteIp={}", maskPhone(phone), clientIp(httpRequest));
 
         LoginOtp loginOtp = new LoginOtp();
         loginOtp.setPhone(phone);
@@ -51,22 +57,33 @@ public class AuthService {
         loginOtp.setExpiresAt(Instant.now().plusSeconds(1000000));
         loginOtpRepository.save(loginOtp);
 
-        System.out.println("TEST OTP for " + phone + " is " + otp);
+        if (otpLogEnabled) {
+            System.out.println("TEST OTP for " + phone + " is " + otp);
+            log.info("TEST OTP generated phone={} otp={} expiresAt={}", maskPhone(phone), otp, loginOtp.getExpiresAt());
+        } else {
+            log.info("OTP generated phone={} expiresAt={}", maskPhone(phone), loginOtp.getExpiresAt());
+        }
 
-        return new OtpResponse(phone, 300, "OTP generated. Check server console in test mode.");
+        String message = otpLogEnabled
+                ? "OTP generated. Check server console in test mode."
+                : "OTP generated.";
+        return new OtpResponse(phone, 300, message);
     }
 
     @Transactional
     public AuthResponse verifyOtp(VerifyOtpRequest request, HttpServletRequest httpRequest) {
         String phone = normalizePhone(request.getPhone());
+        log.info("OTP verification started phone={} remoteIp={}", maskPhone(phone), clientIp(httpRequest));
         LoginOtp loginOtp = loginOtpRepository.findFirstByPhoneAndUsedFalseOrderByCreatedAtDesc(phone)
                 .orElseThrow(() -> new IllegalArgumentException("OTP not found"));
 
         if (loginOtp.getExpiresAt().isBefore(Instant.now())) {
+            log.warn("OTP verification failed reason=expired phone={} otpId={}", maskPhone(phone), loginOtp.getId());
             throw new IllegalArgumentException("OTP expired");
         }
 
         if (!loginOtp.getOtp().equals(request.getOtp())) {
+            log.warn("OTP verification failed reason=invalid phone={} otpId={}", maskPhone(phone), loginOtp.getId());
             throw new IllegalArgumentException("Invalid OTP");
         }
 
@@ -76,12 +93,14 @@ public class AuthService {
         User user = userRepository.findByPhone(phone)
                 .orElseGet(() -> createPhoneUser(phone, request));
         walletService.createStartingWallet(user);
+        log.info("OTP verification succeeded phone={} userId={} username={}", maskPhone(phone), user.getId(), user.getUsername());
         return issueTokens(user);
     }
 
     @Transactional
     public List<UserSummary> getTestUsers() {
         requireTestUsersEnabled();
+        log.info("Ensuring test users");
         return ensureTestUsers()
                 .stream()
                 .map(UserSummary::from)
@@ -91,6 +110,7 @@ public class AuthService {
     @Transactional
     public List<AuthResponse> getTestUserSessions() {
         requireTestUsersEnabled();
+        log.info("Issuing test user sessions");
         return ensureTestUsers().stream()
                 .map(this::issueTokens)
                 .toList();
@@ -98,6 +118,7 @@ public class AuthService {
 
     public AuthResponse refresh(String token,
             HttpServletRequest httpRequest) {
+        log.info("Refresh token requested remoteIp={}", clientIp(httpRequest));
 
         RefreshToken stored = refreshTokenRepository.findByToken(token)
                 .orElseThrow(() -> new RuntimeException("Invalid refresh token"));
@@ -112,17 +133,20 @@ public class AuthService {
 
         String newAccess = jwtService.generateAccessToken(
                 stored.getUser().getUsername());
+        log.info("Refresh token succeeded userId={} username={}", stored.getUser().getId(), stored.getUser().getUsername());
         return new AuthResponse(newAccess, token, UserSummary.from(stored.getUser()));
     }
 
     public void logout(String token,
             HttpServletRequest httpRequest) {
+        log.info("Logout requested remoteIp={}", clientIp(httpRequest));
 
         RefreshToken stored = refreshTokenRepository.findByToken(token)
                 .orElseThrow(() -> new RuntimeException("Invalid refresh token"));
 
         stored.setRevoked(true);
         refreshTokenRepository.save(stored);
+        log.info("Logout completed userId={} username={}", stored.getUser().getId(), stored.getUser().getUsername());
     }
 
     private User createPhoneUser(String phone, VerifyOtpRequest request) {
@@ -135,7 +159,9 @@ public class AuthService {
                 : request.getNickname().trim());
         user.setAvatarUrl(request.getAvatarUrl());
         user.setRole(Role.USER);
-        return userRepository.save(user);
+        User savedUser = userRepository.save(user);
+        log.info("Created phone user userId={} username={} phone={}", savedUser.getId(), savedUser.getUsername(), maskPhone(phone));
+        return savedUser;
     }
 
     private AuthResponse issueTokens(User user) {
@@ -145,6 +171,8 @@ public class AuthService {
         refreshToken.setUser(user);
         refreshToken.setExpiryDate(Instant.now().plusSeconds(7 * 24 * 60 * 60));
         refreshTokenRepository.save(refreshToken);
+        log.info("Issued auth tokens userId={} username={} refreshTokenId={}",
+                user.getId(), user.getUsername(), refreshToken.getId());
         return new AuthResponse(accessToken, refreshToken.getToken(), UserSummary.from(user));
     }
 
@@ -186,6 +214,24 @@ public class AuthService {
     private String generateOtp() {
         int value = new SecureRandom().nextInt(900000) + 100000;
         return String.valueOf(value);
+    }
+
+    private String clientIp(HttpServletRequest request) {
+        if (request == null) {
+            return "-";
+        }
+        String forwardedFor = request.getHeader("X-Forwarded-For");
+        if (forwardedFor != null && !forwardedFor.isBlank()) {
+            return forwardedFor.split(",")[0].trim();
+        }
+        return request.getRemoteAddr();
+    }
+
+    private String maskPhone(String phone) {
+        if (phone == null || phone.length() <= 4) {
+            return "****";
+        }
+        return "****" + phone.substring(phone.length() - 4);
     }
 
     private record TestUserSpec(String username, String phone, String nickname, String avatarUrl) {

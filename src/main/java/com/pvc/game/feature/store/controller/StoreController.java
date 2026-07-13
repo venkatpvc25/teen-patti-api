@@ -25,10 +25,12 @@ import com.pvc.game.feature.wallet.service.WalletService;
 
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
 @RestController
 @RequestMapping("/store")
 @RequiredArgsConstructor
+@Slf4j
 public class StoreController {
 
     private final ShopItemRepository shopItemRepository;
@@ -39,12 +41,16 @@ public class StoreController {
 
     @GetMapping("/items")
     public ApiResponse<List<ShopItem>> items() {
-        return ApiResponse.ok(shopItemRepository.findByActiveTrueOrderByChipsAsc());
+        List<ShopItem> items = shopItemRepository.findByActiveTrueOrderByChipsAsc();
+        log.info("Store items fetched count={}", items.size());
+        return ApiResponse.ok(items);
     }
 
     @PostMapping("/razorpay/orders")
     public ApiResponse<RazorpayOrderResponse> createRazorpayOrder(@Valid @RequestBody CreateRazorpayOrderRequest request) {
         var user = currentUserService.requireCurrentUser();
+        log.info("Razorpay order requested userId={} shopItemId={} platform={}",
+                user.getId(), request.getShopItemId(), request.getPlatform());
         var item = shopItemRepository.findById(request.getShopItemId())
                 .orElseThrow(() -> new IllegalArgumentException("Shop item not found"));
 
@@ -59,6 +65,8 @@ public class StoreController {
         String orderId = razorpayService.createOrder(purchase);
         purchase.setProviderOrderId(orderId);
         purchaseRepository.save(purchase);
+        log.info("Razorpay order created userId={} purchaseId={} razorpayOrderId={} amountPaise={} chips={}",
+                user.getId(), purchase.getId(), orderId, purchase.getAmountPaise(), item.getChips());
 
         return ApiResponse.ok(new RazorpayOrderResponse(
                 purchase.getId(),
@@ -73,6 +81,8 @@ public class StoreController {
     @PostMapping("/razorpay/verify")
     public ApiResponse<RewardResponse> verifyRazorpayPayment(@Valid @RequestBody VerifyRazorpayPaymentRequest request) {
         var user = currentUserService.requireCurrentUser();
+        log.info("Razorpay payment verification requested userId={} razorpayOrderId={} razorpayPaymentId={}",
+                user.getId(), request.getRazorpayOrderId(), request.getRazorpayPaymentId());
         Purchase purchase = purchaseRepository.findByProviderOrderId(request.getRazorpayOrderId())
                 .orElseThrow(() -> new IllegalArgumentException("Purchase not found"));
 
@@ -82,6 +92,8 @@ public class StoreController {
 
         if (purchase.getStatus() == PurchaseStatus.PAID) {
             var wallet = walletService.getWallet(user);
+            log.info("Razorpay payment verification skipped alreadyPaid userId={} purchaseId={} balance={}",
+                    user.getId(), purchase.getId(), wallet.getBalance());
             return ApiResponse.ok(new RewardResponse(0, wallet.getBalance(), "ALREADY_PAID"));
         }
 
@@ -96,6 +108,8 @@ public class StoreController {
         if (!valid) {
             purchase.setStatus(PurchaseStatus.FAILED);
             purchaseRepository.save(purchase);
+            log.warn("Razorpay payment verification failed invalidSignature userId={} purchaseId={} razorpayOrderId={} razorpayPaymentId={}",
+                    user.getId(), purchase.getId(), request.getRazorpayOrderId(), request.getRazorpayPaymentId());
             throw new IllegalArgumentException("Invalid Razorpay signature");
         }
 
@@ -107,6 +121,8 @@ public class StoreController {
 
         ShopItem item = purchase.getShopItem();
         var wallet = walletService.credit(user, item.getChips(), item.isVip() ? "VIP_PURCHASE" : "CHIP_PURCHASE", purchase.getId().toString());
+        log.info("Razorpay payment verified userId={} purchaseId={} razorpayPaymentId={} chips={} balance={}",
+                user.getId(), purchase.getId(), request.getRazorpayPaymentId(), item.getChips(), wallet.getBalance());
         return ApiResponse.ok(new RewardResponse(item.getChips(), wallet.getBalance(), item.isVip() ? "VIP_PURCHASE" : "CHIP_PURCHASE"));
     }
 }

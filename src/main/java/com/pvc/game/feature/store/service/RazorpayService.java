@@ -19,15 +19,14 @@ import com.pvc.game.feature.store.config.RazorpayProperties;
 import com.pvc.game.feature.store.entity.Purchase;
 
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class RazorpayService {
 
     private static final URI ORDERS_URI = URI.create("https://api.razorpay.com/v1/orders");
-    private static final URI CONTACTS_URI = URI.create("https://api.razorpay.com/v1/contacts");
-    private static final URI FUND_ACCOUNTS_URI = URI.create("https://api.razorpay.com/v1/fund_accounts");
-    private static final URI PAYOUTS_URI = URI.create("https://api.razorpay.com/v1/payouts");
 
     private final RazorpayProperties properties;
     private final ObjectMapper objectMapper;
@@ -36,6 +35,11 @@ public class RazorpayService {
     public String createOrder(Purchase purchase) {
         requireConfigured();
         try {
+            log.info("Calling Razorpay createOrder purchaseId={} amountPaise={} currency={} shopItemId={}",
+                    purchase.getId(),
+                    purchase.getAmountPaise(),
+                    purchase.getCurrency(),
+                    purchase.getShopItem().getId());
             String requestBody = objectMapper.writeValueAsString(Map.of(
                     "amount", purchase.getAmountPaise(),
                     "currency", purchase.getCurrency(),
@@ -52,12 +56,18 @@ public class RazorpayService {
 
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                log.warn("Razorpay createOrder failed purchaseId={} status={} body={}",
+                        purchase.getId(), response.statusCode(), response.body());
                 throw new IllegalStateException("Razorpay order creation failed: " + response.body());
             }
 
             JsonNode json = objectMapper.readTree(response.body());
-            return json.get("id").asText();
+            String orderId = json.get("id").asText();
+            log.info("Razorpay createOrder succeeded purchaseId={} razorpayOrderId={} status={}",
+                    purchase.getId(), orderId, response.statusCode());
+            return orderId;
         } catch (Exception exception) {
+            log.error("Razorpay createOrder crashed purchaseId={}", purchase.getId(), exception);
             throw new IllegalStateException("Unable to create Razorpay order", exception);
         }
     }
@@ -70,59 +80,12 @@ public class RazorpayService {
             mac.init(new SecretKeySpec(properties.getKeySecret().getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
             byte[] digest = mac.doFinal(payload.getBytes(StandardCharsets.UTF_8));
             String expected = toHex(digest);
-            return constantTimeEquals(expected, signature);
+            boolean valid = constantTimeEquals(expected, signature);
+            log.info("Razorpay signature checked orderId={} paymentId={} valid={}", orderId, paymentId, valid);
+            return valid;
         } catch (Exception exception) {
+            log.error("Razorpay signature verification crashed orderId={} paymentId={}", orderId, paymentId, exception);
             throw new IllegalStateException("Unable to verify Razorpay signature", exception);
-        }
-    }
-
-    public String createContact(String name, String phone, String userId) {
-        requireConfigured();
-        try {
-            String requestBody = objectMapper.writeValueAsString(Map.of(
-                    "name", fallback(name, "Game user"),
-                    "contact", fallback(phone, "0000000000"),
-                    "type", "customer",
-                    "reference_id", userId));
-            JsonNode json = post(CONTACTS_URI, requestBody, "Razorpay contact creation failed");
-            return json.get("id").asText();
-        } catch (Exception exception) {
-            throw new IllegalStateException("Unable to create Razorpay contact", exception);
-        }
-    }
-
-    public String createUpiFundAccount(String contactId, String upiId) {
-        requireConfigured();
-        try {
-            String requestBody = objectMapper.writeValueAsString(Map.of(
-                    "contact_id", contactId,
-                    "account_type", "vpa",
-                    "vpa", Map.of("address", upiId)));
-            JsonNode json = post(FUND_ACCOUNTS_URI, requestBody, "Razorpay fund account creation failed");
-            return json.get("id").asText();
-        } catch (Exception exception) {
-            throw new IllegalStateException("Unable to create Razorpay fund account", exception);
-        }
-    }
-
-    public String createPayout(String fundAccountId, long amountPaise, String referenceId, String narration) {
-        requirePayoutConfigured();
-        try {
-            String requestBody = objectMapper.writeValueAsString(Map.of(
-                    "account_number", properties.getAccountNumber(),
-                    "fund_account_id", fundAccountId,
-                    "amount", amountPaise,
-                    "currency", "INR",
-                    "mode", "UPI",
-                    "purpose", "payout",
-                    "queue_if_low_balance", true,
-                    "reference_id", referenceId,
-                    "narration", narration,
-                    "notes", Map.of("withdrawalId", referenceId)));
-            JsonNode json = post(PAYOUTS_URI, requestBody, "Razorpay payout creation failed");
-            return json.get("id").asText();
-        } catch (Exception exception) {
-            throw new IllegalStateException("Unable to create Razorpay payout", exception);
         }
     }
 
@@ -131,27 +94,14 @@ public class RazorpayService {
         return properties.getKeyId();
     }
 
-    public long withdrawalPaiseFor(long chips) {
-        if (chips <= 0) {
-            throw new IllegalArgumentException("Withdrawal chips must be greater than zero");
-        }
-        return Math.multiplyExact(chips, properties.getWithdrawalPaisePerChip());
-    }
-
     private void requireConfigured() {
         if (isBlank(properties.getKeyId()) || isBlank(properties.getKeySecret())) {
             throw new IllegalStateException("Razorpay credentials are not configured");
         }
     }
 
-    private void requirePayoutConfigured() {
-        requireConfigured();
-        if (isBlank(properties.getAccountNumber())) {
-            throw new IllegalStateException("Razorpay account number is not configured");
-        }
-    }
-
     private JsonNode post(URI uri, String body, String errorPrefix) throws Exception {
+        log.debug("Razorpay POST uri={}", uri);
         HttpRequest request = HttpRequest.newBuilder(uri)
                 .header("Authorization", basicAuth())
                 .header("Content-Type", "application/json")
@@ -160,18 +110,16 @@ public class RazorpayService {
 
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            log.warn("Razorpay POST failed uri={} status={} body={}", uri, response.statusCode(), response.body());
             throw new IllegalStateException(errorPrefix + ": " + response.body());
         }
+        log.debug("Razorpay POST succeeded uri={} status={}", uri, response.statusCode());
         return objectMapper.readTree(response.body());
     }
 
     private String basicAuth() {
         String credentials = properties.getKeyId() + ":" + properties.getKeySecret();
         return "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private String fallback(String value, String fallback) {
-        return isBlank(value) ? fallback : value;
     }
 
     private boolean isBlank(String value) {

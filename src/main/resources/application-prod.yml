@@ -16,13 +16,17 @@ jwt:
   access-expiration: ${JWT_ACCESS_EXPIRATION:3600000}
 
 app:
+  cors:
+    allowed-origins: ${APP_CORS_ALLOWED_ORIGINS}
+  docs:
+    public-enabled: ${APP_DOCS_PUBLIC_ENABLED:false}
+  otp:
+    log-enabled: ${APP_OTP_LOG_ENABLED:false}
   test-users:
     enabled: ${TEST_USERS_ENABLED:false}
   razorpay:
     key-id: ${RAZORPAY_KEY_ID}
     key-secret: ${RAZORPAY_KEY_SECRET}
-    account-number: ${RAZORPAY_ACCOUNT_NUMBER:}
-    withdrawal-paise-per-chip: ${RAZORPAY_WITHDRAWAL_PAISE_PER_CHIP:1}
 
 server:
   port: ${SERVER_PORT:8080}
